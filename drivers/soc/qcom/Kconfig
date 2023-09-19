@@ -42,6 +42,15 @@ config PARO_DTB
 	help
 		Only include Motorola Paro device specific device tree
 
+
+config CUSCO_DTB
+    depends on MMI_DEVICE_DTBS
+    default n
+    bool "Motorola Mobility Cusco Device DTB"
+    help
+        Only include Motorola Cusco device specific DTB.
+
+
 config SPS
 	tristate "SPS support"
 	select GENERIC_ALLOCATOR
