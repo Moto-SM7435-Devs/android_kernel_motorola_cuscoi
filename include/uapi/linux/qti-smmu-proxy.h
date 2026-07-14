@@ -1,0 +1,1 @@
+../../../../sm7435-modules/qcom/opensource/securemsm-kernel/smmu-proxy/include/uapi/linux/qti-smmu-proxy.h
