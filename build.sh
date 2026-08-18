@@ -591,7 +591,7 @@ build_mmi_modules() {
         msg "Building MMI module: ${module_dir}"
         local -a extra_args=()
         if [[ -n "${mmi_args[$i]}" ]]; then
-            read -r -a extra_args <<< "${mmi_args[$i]}"
+            IFS=' ' read -r -a extra_args <<< "${mmi_args[$i]}"
         fi
 
         make "${MAKE_FLAGS[@]}" -j"${PROCS}" \
