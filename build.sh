@@ -77,6 +77,7 @@ KBRANCH="${KBRANCH:-android-16}"
 # Device-tree search roots and glob patterns for dtree()
 DTS_ROOTS=(
     "arch/arm64/boot/dts"
+    "arch/arm64/boot/dts/vendor"
     "vendor/qcom/opensource/devicetrees"
     "vendor/qcom/opensource/display-devicetree"
 )
@@ -217,7 +218,7 @@ run_make() { make "${MAKE_FLAGS[@]}" "$@"; }
 requirements() {
     step "Checking requirements"
     local missing=() tool
-    for tool in awk bc bison cpio find flex git make perl python3 sed sort tee xargs zip; do
+    for tool in awk bc bison cpio depmod find flex git make perl python3 sed sort tee xargs zip; do
         command -v "${tool}" >/dev/null 2>&1 || missing+=("${tool}")
     done
     ((${#missing[@]} == 0)) || abort "Missing required tools: ${missing[*]}"
@@ -399,9 +400,17 @@ dtree() {
             while IFS= read -r file; do
                 found=1
                 printf '  %s\n' "${file#${KDIR}/}"
-            done < <(find "${KDIR}/${root}" -type f -iname "${pattern}" 2>/dev/null | sort)
+            done < <(find -L "${KDIR}/${root}" -type f -iname "${pattern}" 2>/dev/null | sort)
         done
     done
+    if [[ -L "${KDIR}/arch/arm64/boot/dts/vendor" ]]; then
+        msg "Vendor DTS link: arch/arm64/boot/dts/vendor -> $(readlink "${KDIR}/arch/arm64/boot/dts/vendor")"
+    elif [[ -d "${KDIR}/arch/arm64/boot/dts/vendor" ]]; then
+        msg "Vendor DTS directory: arch/arm64/boot/dts/vendor"
+    else
+        warn "arch/arm64/boot/dts/vendor is missing"
+    fi
+
     ((found == 1)) || warn "No matching device-tree source files found in-tree."
 }
 
@@ -493,24 +502,76 @@ img() {
 dtb() {
     requirements
     rgn
+
     step "Building DTBs / DTBO"
     dtree
 
-    run_make -j"${PROCS}" dtbs KBUILD_MIXED_TREE="${DIST_DIR}" 2>&1 | tee -a "${LOG_FILE}" || abort "DTB build failed"
+    # ---------------------------------------------------------
+    # Motorola MMI device-tree configuration
+    # ---------------------------------------------------------
+    local -a DT_CONFIG_FLAGS=(
+        CONFIG_BUILD_ARM64_DT_OVERLAY=y
+        CONFIG_MMI_DEVICE_DTBS=y
+    )
 
-    # Build dtbo / dtbo.img only when the tree exposes those targets
-    for target in dtbo dtbo.img; do
-        if run_make -s help 2>/dev/null | awk '{print $1}' | grep -qx "${target}"; then
-            msg "Building ${target}"
-            run_make -j"${PROCS}" "${target}" KBUILD_MIXED_TREE="${DIST_DIR}" 2>&1 | tee -a "${LOG_FILE}" ||
-                warn "${target} build failed (non-fatal)"
+    msg "DT configuration:"
+    echo "    CONFIG_BUILD_ARM64_DT_OVERLAY=y"
+    echo "    CONFIG_MMI_DEVICE_DTBS=y"
+
+    # ---------------------------------------------------------
+    # Build kernel DTBs + DTBOs
+    #
+    # KBUILD_MIXED_TREE matches the Motorola MMI build flow.
+    # The two CONFIG_* values are explicitly enabled for this
+    # DTB/DTBO build.
+    # ---------------------------------------------------------
+    msg "Building kernel DTBs / DTBOs"
+
+    run_make -j"${PROCS}" \
+        dtbs \
+        KBUILD_MIXED_TREE="${DIST_DIR}" \
+        "${DT_CONFIG_FLAGS[@]}" \
+        2>&1 | tee -a "${LOG_FILE}" ||
+        abort "DTB/DTBO build failed"
+
+    # ---------------------------------------------------------
+    # Collect individual .dtb / .dtbo files
+    # ---------------------------------------------------------
+    mkdir -p "${DIST_DIR}"
+    _copy_dt_outputs
+
+    # ---------------------------------------------------------
+    # dtbo.img is optional.
+    # Some Qualcomm trees generate individual .dtbo files
+    # while the Android/OEM build creates dtbo.img later.
+    # ---------------------------------------------------------
+    local dtbo_candidates=(
+        "${OUT_DIR}/arch/arm64/boot/dtbo.img"
+        "${DIST_DIR}/dtbo.img"
+        "${DIST_DIR}/dtbs/dtbo.img"
+        "${OUT_DIR}/dtbo.img"
+    )
+
+    local dtbo_found=""
+    local candidate
+
+    for candidate in "${dtbo_candidates[@]}"; do
+        if [[ -f "${candidate}" ]]; then
+            dtbo_found="${candidate}"
+            break
         fi
     done
 
-    mkdir -p "${DIST_DIR}"
-    _copy_dt_outputs
-    [[ -f "${OUT_DIR}/arch/arm64/boot/dtbo.img" ]] &&
-        cp -p "${OUT_DIR}/arch/arm64/boot/dtbo.img" "${DIST_DIR}/"
+    if [[ -n "${dtbo_found}" ]]; then
+        if [[ "${dtbo_found}" != "${DIST_DIR}/dtbo.img" ]]; then
+            cp -p "${dtbo_found}" "${DIST_DIR}/dtbo.img" ||
+                abort "Failed to stage dtbo.img"
+        fi
+
+        ok "DTBO image → ${DIST_DIR}/dtbo.img"
+    else
+        warn "No dtbo.img generated; individual DTBO blobs are available in ${DIST_DIR}/dtbs"
+    fi
 }
 
 # Build the Motorola MMI out-of-tree modules that are present in the tree.
@@ -573,8 +634,8 @@ build_mmi_modules() {
         "CONFIG_WIRELESS_CPS4035B=y"
         "CONFIG_INPUT_TOUCHSCREEN_MMI=y CONFIG_DRM_PANEL_EVENT_NOTIFICATIONS=y CONFIG_BOARD_USES_DOUBLE_TAP_CTRL=y CONFIG_BUILD_FOR_ANDROID_V=y"
         "CONFIG_INPUT_TOUCHSCREEN_MMI=y CONFIG_AW96XX_POWER_SUPPLY_ONLINE=y"
-        "CONFIG_INPUT_TOUCHSCREEN_MMI=y CONFIG_GTP_FOD=y CONFIG_GTP_LAST_TIME=y CONFIG_BOARD_USES_DOUBLE_TAP_CTRL=y CONFIG_BUILD_KERNEL_VARIANT_PERF=y"
-        "CONFIG_INPUT_TOUCHSCREEN_MMI=y CONFIG_FOCALTECH_V3_MMI_IC_NAME=ft3683g CONFIG_FTS_DOUBLE_TAP_CONTROL=y CONFIG_FTS_LAST_TIME=y CONFIG_BUILD_FOR_ANDROID_V=y"
+        "CONFIG_INPUT_TOUCHSCREEN_MMI=y CONFIG_DRM_PANEL_EVENT_NOTIFICATIONS=y CONFIG_GTP_FOD=y CONFIG_GTP_LAST_TIME=y CONFIG_BOARD_USES_DOUBLE_TAP_CTRL=y CONFIG_BUILD_KERNEL_VARIANT_PERF=y"
+        "CONFIG_INPUT_CHIPONE_0FLASH_MMI_ENABLE_DOUBLE_TAP=y CONFIG_GTP_LAST_TIME=y CONFIG_BOARD_USES_DOUBLE_TAP_CTRL=y CONFIG_INPUT_TOUCHSCREEN_MMI=y CONFIG_INPUT_TOUCHSCREEN_MMI=y MODULE_KERNEL_VERSION=5.15 CONFIG_INPUT_FOCALTECH_0FLASH_MMI_IC_NAME=ft3683g CONFIG_BOARD_USES_DOUBLE_TAP_CTRL=y CONFIG_FOCALTECH_LAST_TIME=y CONFIG_DRM_PANEL_EVENT_NOTIFICATIONS=y CONFIG_INPUT_TOUCHSCREEN_MMI=y CONFIG_INPUT_FOCALTECH_V3_MMI_IC_NAME=ft3683g CONFIG_INPUT_FOCALTECH_V3_MMI_ENABLE_DOUBLE_TAP=y CONFIG_FTS_DOUBLE_TAP_CONTROL=y CONFIG_INPUT_TOUCHSCREEN_MMI=y CONFIG_DRM_PANEL_EVENT_NOTIFICATIONS=y CONFIG_FTS_COMPATIBLE_WITH_GKI=y CONFIG_FTS_VDD_GPIO_CONTROL=y CONFIG_FTS_LAST_TIME=y CONFIG_FTS_INPUT_ID=y CONFIG_ENABLE_FTS_PALM_CANCEL=y CONFIG_INPUT_FOCAL_IC_NAME=ft3683g CONFIG_INPUT_FOCALTECH_V3_MMI_ENABLE_DOUBLE_TAP=y CONFIG_FTS_DOUBLE_TAP_CONTROL=y CONFIG_INPUT_TOUCHSCREEN_MMI=y CONFIG_DRM_PANEL_EVENT_NOTIFICATIONS=y CONFIG_FTS_COMPATIBLE_WITH_GKI=y CONFIG_SUPPORT_FTS_HIRES_X=16 CONFIG_FTS_VDD_GPIO_CONTROL=y CONFIG_FTS_LAST_TIME=y CONFIG_FTS_INPUT_ID=y CONFIG_FTS_GAME_MODE_EN=y CONFIG_FOCALTECH_REPORT_PRESSURE_DISABLE=y CONFIG_BUILD_FOR_ANDROID_V=y"
     )
 
     local i module_dir
@@ -629,6 +690,24 @@ mod() {
 
     mkdir -p "${DIST_DIR}"
     _copy_modules
+
+    # Motorola's OEM build prepares the external-module environment before
+    # compiling Moto DLKM modules. In the OEM build, Module.symvers is copied
+    # from the kernel distribution output into OUT_DIR before modules_prepare.
+    msg "Preparing external-module build environment"
+
+    [[ -f "${OUT_DIR}/Module.symvers" ]] ||
+        abort "Missing ${OUT_DIR}/Module.symvers — kernel Module.symvers was not generated"
+
+    cp -p "${OUT_DIR}/Module.symvers" "${DIST_DIR}/Module.symvers" ||
+        abort "Failed to stage Module.symvers in ${DIST_DIR}"
+
+    run_make olddefconfig ||
+        abort "olddefconfig failed for external modules"
+
+    run_make modules_prepare ||
+        abort "modules_prepare failed for external modules"
+
     build_mmi_modules
 }
 
@@ -660,10 +739,14 @@ hdr() {
 all() {
     local start end elapsed
     start=$(date +%s)
-    step "Full build — image + modules + DTBs"
+    step "Full build — image + DTBs + modules"
+
+    # Match the MMI build order: kernel image first, then device-tree
+    # artifacts, then external/module builds.
     img
-    mod
     dtb
+    mod
+
     end=$(date +%s)
     elapsed=$((end - start))
     ok "Full build complete in $((elapsed / 60))m $((elapsed % 60))s"
@@ -807,7 +890,7 @@ ${BOLD}Usage:${NC} bash $0 <command> [command...]
 ${BOLD}─── Build ───────────────────────────────────────────────────────${NC}
   all         Full build: image + modules + DTBs
   img         Build kernel image (Image / Image.gz / Image.lz4)
-  dtb         Build all DTBs and DTBO / dtbo.img
+  dtb         Build all DTBs / DTBO blobs (dtbo.img optional)
   mod         Build and install all configured modules
   hdr         Build UAPI kernel headers tarball
   mkzip       Package dist artifacts into AnyKernel3 zip
@@ -861,7 +944,7 @@ ndialog() {
     local TITLE="${KNAME} Kernel Builder"
 
     local OPTIONS=(
-        1  "Full build            (image + modules + DTBs)"
+        1  "Full build            (image + DTBs + modules)"
         2  "Build kernel image    (Image / Image.gz / Image.lz4)"
         3  "Build DTBs / DTBO"
         4  "Build modules"
@@ -887,7 +970,7 @@ ndialog() {
         --backtitle "${BACKTITLE}" \
         --title " ${TITLE} " \
         --menu "Select an action:" 26 62 18 \
-        1  "Full build  (image + modules + DTBs)" \
+        1  "Full build  (image + DTBs + modules)" \
         2  "Build kernel image" \
         3  "Build DTBs / DTBO" \
         4  "Build modules" \
