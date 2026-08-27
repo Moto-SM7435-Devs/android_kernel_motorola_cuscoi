@@ -74,6 +74,39 @@ DEVICETREES_REPO="https://github.com/Moto-SM7435-Devs/android_kernel_motorola_sm
 AK3_REPO="${AK3_REPO:-https://github.com/Moto-SM7435-Devs/AnyKernel3}"
 KBRANCH="${KBRANCH:-android-16}"
 
+# AOSP-compatible module archive staging (vendor_dlkm XZ tarball,
+# vendor_ramdisk LZ4 CPIO, optional system_dlkm XZ tarball) — these are
+# exactly the artifact names anykernel.sh looks for: modules/dlkm.tar.xz,
+# modules/dlkm.cpio.lz4 and modules/sdlkm.tar.xz.
+DLKM_DIR="${OUT_DIR}/vendor_dlkm"
+VNDR_DIR="${OUT_DIR}/vendor_ramdisk"
+SDLKM_DIR="${OUT_DIR}/system_dlkm"
+DEPMOD_REL="0.0"
+DEPMOD_DIR="lib/modules/${DEPMOD_REL}"
+DLKM_MODULES_SUBDIR="vendor/lib/modules"
+VNDR_MODULES_SUBDIR="lib/modules"
+SDLKM_MODULES_SUBDIR="system_dlkm/lib/modules"
+
+# Pre-built modules.load lists — if present in the synced devicetrees
+# repo (see `repos`), only the named modules are routed into each
+# archive. Without them, every built .ko falls back to vendor_dlkm.
+VNDR_MODULES_LOAD_SRC="${DEVICETREES_DIR}/modules/modules.load.vendor_boot"
+DLKM_MODULES_LOAD_SRC="${DEVICETREES_DIR}/modules/modules.load.vendor_dlkm"
+RECOVERY_MODULES_LOAD_SRC="${DEVICETREES_DIR}/modules/modules.load.recovery"
+
+# Module routing is now automatic by origin:
+#   sm7435-modules (Motorola MMI drivers)  → vendor_dlkm / vendor_ramdisk
+#   in-tree kernel modules (out/dist/modules) → system_dlkm
+#
+# Manual overrides below are additive on top of that: force specific
+# built modules (by filename) into vendor_ramdisk (early/boot-critical)
+# or fold extra modules into system_dlkm regardless of origin. Empty by
+# default — fill in per-device.
+VENDOR_RAMDISK_EXTRA=(
+)
+SYSTEM_DLKM_EXTRA=(
+)
+
 # Device-tree search roots and glob patterns for dtree()
 DTS_ROOTS=(
     "arch/arm64/boot/dts"
@@ -454,6 +487,9 @@ _strip_modules() {
 
 # Copy installed modules to DIST_DIR/modules, optionally stripping them
 _copy_modules() {
+    # Start from a clean in-tree set. External modules are added later and
+    # must never be included in the system_dlkm snapshot.
+    rm -rf "${DIST_DIR}/modules"
     mkdir -p "${DIST_DIR}/modules"
     find "${MODULES_INSTALL_DIR}" -type f -name '*.ko' -print0 2>/dev/null |
         xargs -0 -r -I{} cp -p {} "${DIST_DIR}/modules/" ||
@@ -461,8 +497,374 @@ _copy_modules() {
     [[ "${DEBUG}" == "0" ]] && _strip_modules
     find "${DIST_DIR}/modules" -type f -name '*.ko' -print | sort \
         > "${DIST_DIR}/modules.list"
+
+    # Snapshot: everything staged in DIST_DIR/modules at this point comes
+    # straight from the in-tree kernel build (modules_install). This runs
+    # before build_mmi_modules() adds the sm7435-modules drivers, so this
+    # snapshot cleanly identifies the "kernel tree" module set that
+    # package_module_archives() routes into system_dlkm.
+    find "${DIST_DIR}/modules" -maxdepth 1 -type f -name '*.ko' -printf '%f\n' \
+        | sort > "${DIST_DIR}/modules-system.list"
+
     local n; n=$(wc -l < "${DIST_DIR}/modules.list" 2>/dev/null || echo 0)
     ok "${n} module(s) → ${DIST_DIR}/modules"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  §12b  AOSP-COMPATIBLE MODULE ARCHIVES (vendor_dlkm / vendor_ramdisk / system_dlkm)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# depmod MUST see modules directly under:
+#   <staging-root>/lib/modules/<kernel-release>/
+#
+# The previous implementation put .ko files below an extra
+# vendor/lib/modules layer before running depmod.  That makes depmod
+# unable to find modules.order/modules.builtin and produces:
+#   WARNING: could not open modules.order
+#   WARNING: could not open modules.builtin
+#
+# Keep the depmod tree canonical and only add the archive-specific
+# load/config files around it.
+
+_stage_and_depmod() {
+    local root="$1"
+    local full="$2"
+
+    # depmod requires the canonical Android module layout:
+    #   <root>/lib/modules/<release>/*.ko
+    mkdir -p "${full}"
+
+    # modules_install is the preferred source for the kernel-generated
+    # metadata.  External/Moto modules may not have all of these files,
+    # however, so create safe fallbacks rather than allowing depmod to fail.
+    local src="${MODULES_INSTALL_DIR}/${DEPMOD_DIR}"
+    local meta
+
+    for meta in modules.order modules.builtin modules.builtin.modinfo; do
+        if [[ -f "${src}/${meta}" && ! -f "${full}/${meta}" ]]; then
+            cp -p "${src}/${meta}" "${full}/${meta}" ||
+                abort "Failed to stage ${meta} into ${full}"
+        fi
+    done
+
+    # modules.order is required by depmod for a clean module tree.  If the
+    # kernel's modules_install did not generate it, construct one from the
+    # modules actually staged into this partition.
+    if [[ ! -f "${full}/modules.order" ]]; then
+        find "${full}" -maxdepth 1 -type f -name '*.ko' -printf '%f\n' |
+            sort > "${full}/modules.order" ||
+            abort "Failed to generate ${full}/modules.order"
+    fi
+
+    # These are valid empty metadata files when no built-in modules are
+    # represented in this partition.  Their presence avoids noisy depmod
+    # warnings for vendor_dlkm/vendor_ramdisk staging trees.
+    : > "${full}/modules.builtin" 2>/dev/null ||
+        abort "Failed to create ${full}/modules.builtin"
+    : > "${full}/modules.builtin.modinfo" 2>/dev/null ||
+        abort "Failed to create ${full}/modules.builtin.modinfo"
+
+    # depmod writes modules.dep, modules.alias, modules.softdep,
+    # modules.symbols, etc. DIRECTLY into ${full}.  Do not copy those files
+    # back into ${full}; that would copy a file onto itself and fail with:
+    #   cp: ...modules.alias and ...modules.alias are the same file
+    depmod -b "${root}" "${DEPMOD_REL}" ||
+        abort "depmod failed for ${root}"
+
+    # Android's packaged modules.dep should reference /lib/modules/... rather
+    # than the temporary staging root used during packaging.
+    if [[ -f "${full}/modules.dep" ]]; then
+        sed -i \
+            -e 's|\([^: ]*lib/modules/[^: ]*\)|/\1|g' \
+            "${full}/modules.dep" 2>/dev/null || true
+    fi
+}
+
+# Copy modules named in a modules.load file from DIST_DIR/modules.
+# Returns 1 when the load file does not exist.
+_copy_by_load_file() {
+    local load_file="$1" dest="$2" modname
+
+    [[ -f "${load_file}" ]] || return 1
+    mkdir -p "${dest}"
+
+    while IFS= read -r modname; do
+        # Ignore blank lines and comments.
+        [[ -n "${modname}" && "${modname}" != \#* ]] || continue
+
+        if [[ -f "${DIST_DIR}/modules/${modname}" ]]; then
+            cp -p "${DIST_DIR}/modules/${modname}" "${dest}/" ||
+                abort "Failed to stage ${modname} from modules.load"
+        else
+            warn "modules.load references missing module: ${modname}"
+        fi
+    done <"${load_file}"
+
+    cp -p "${load_file}" "${dest}/modules.load"
+}
+
+# Copy modules named in a plain list file (one basename per line, as
+# produced by modules-system.list / modules-vendor.list) from
+# DIST_DIR/modules into dest. Returns 1 when the list file is missing
+# or empty.
+_copy_by_name_list() {
+    local list_file="$1" dest="$2" modname
+
+    [[ -s "${list_file}" ]] || return 1
+    mkdir -p "${dest}"
+
+    while IFS= read -r modname; do
+        [[ -n "${modname}" ]] || continue
+        if [[ -f "${DIST_DIR}/modules/${modname}" ]]; then
+            cp -p "${DIST_DIR}/modules/${modname}" "${dest}/" ||
+                abort "Failed to stage ${modname} from $(basename "${list_file}")"
+        else
+            warn "$(basename "${list_file}") references missing module: ${modname}"
+        fi
+    done <"${list_file}"
+}
+
+# Copy every built module into the canonical depmod directory.
+_copy_all_modules() {
+    local dest="$1"
+
+    mkdir -p "${dest}"
+    find "${DIST_DIR}/modules" -maxdepth 1 -type f -name '*.ko' -print0 |
+        xargs -0 -r -I{} cp -p {} "${dest}/" ||
+        abort "Failed to stage built modules"
+}
+
+# Build AOSP-compatible vendor_dlkm (XZ tarball), vendor_ramdisk (LZ4 CPIO)
+# and system_dlkm (XZ tarball) archives.
+#
+#   vendor_dlkm / vendor_ramdisk ← sm7435-modules (Motorola MMI drivers,
+#                                   modules-vendor.list)
+#   system_dlkm                  ← in-tree kernel modules, i.e.
+#                                   out/dist/modules (modules-system.list)
+package_module_archives() {
+    step "Packaging AOSP-compatible module archives"
+
+    if [[ ! -d "${DIST_DIR}/modules" ]] ||
+        [[ -z "$(find "${DIST_DIR}/modules" -maxdepth 1 -name '*.ko' -print -quit 2>/dev/null)" ]]; then
+        warn "No built modules found in ${DIST_DIR}/modules; skipping"
+        return
+    fi
+
+    rm -rf "${DLKM_DIR}" "${VNDR_DIR}" "${SDLKM_DIR}"
+
+    # IMPORTANT:
+    # depmod expects .ko files directly in lib/modules/<release>.
+    local dlkm_full="${DLKM_DIR}/${DEPMOD_DIR}"
+    local vndr_full="${VNDR_DIR}/${DEPMOD_DIR}"
+    local sdlkm_full="${SDLKM_DIR}/${DEPMOD_DIR}"
+
+    mkdir -p "${dlkm_full}" "${vndr_full}"
+
+    # -----------------------------------------------------------------------
+    # Module routing
+    #
+    #   sm7435-modules (Motorola MMI out-of-tree drivers, tracked in
+    #   modules-vendor.list by build_mmi_modules())      → vendor_dlkm /
+    #                                                        vendor_ramdisk
+    #   in-tree kernel modules (tracked in modules-system.list
+    #   by _copy_modules())                               → system_dlkm
+    #     (handled further below, in the system_dlkm section)
+    # -----------------------------------------------------------------------
+    local vendor_list="${DIST_DIR}/modules-vendor.list"
+    local system_list="${DIST_DIR}/modules-system.list"
+
+    if [[ -s "${vendor_list}" ]]; then
+        # Every external Motorola module is vendor-owned. Start with the
+        # complete set so a partial load list cannot silently drop modules.
+        _copy_by_name_list "${vendor_list}" "${dlkm_full}"
+
+        # vendor_boot is a subset of the external modules. Move those files
+        # out of vendor_dlkm so each module is installed in one partition.
+        if [[ -f "${VNDR_MODULES_LOAD_SRC}" ]]; then
+            msg "Routing vendor_ramdisk modules from ${VNDR_MODULES_LOAD_SRC}"
+            _copy_by_load_file "${VNDR_MODULES_LOAD_SRC}" "${vndr_full}" || true
+            local ramdisk_mod
+            while IFS= read -r ramdisk_mod; do
+                [[ -n "${ramdisk_mod}" && "${ramdisk_mod}" != \#* ]] || continue
+                rm -f "${dlkm_full}/${ramdisk_mod}"
+            done <"${VNDR_MODULES_LOAD_SRC}"
+        else
+            # Without a device-specific boot load list, keep the prebuilt
+            # vendor set available in vendor_ramdisk as well as vendor_dlkm.
+            # A modules.load.vendor_boot file can narrow this to boot-critical
+            # modules when the device tree provides one.
+            warn "No modules.load.vendor_boot found; staging all vendor modules in vendor_ramdisk"
+            _copy_by_name_list "${vendor_list}" "${vndr_full}"
+        fi
+
+        if [[ -f "${DLKM_MODULES_LOAD_SRC}" ]]; then
+            cp -p "${DLKM_MODULES_LOAD_SRC}" "${dlkm_full}/modules.load"
+        fi
+    else
+        warn "No sm7435-modules (MMI) drivers were built; vendor archives will be empty"
+    fi
+
+    # -----------------------------------------------------------------------
+    # Manual override: force specific modules into vendor_ramdisk.
+    # -----------------------------------------------------------------------
+    local mod
+    for mod in "${VENDOR_RAMDISK_EXTRA[@]}"; do
+        [[ -f "${DIST_DIR}/modules/${mod}" ]] || {
+            warn "VENDOR_RAMDISK_EXTRA: missing ${mod}"
+            continue
+        }
+
+        cp -p "${DIST_DIR}/modules/${mod}" "${vndr_full}/" ||
+            abort "Failed to stage ${mod} into vendor_ramdisk"
+
+        rm -f "${dlkm_full}/${mod}"
+    done
+
+    # -----------------------------------------------------------------------
+    # vendor_dlkm
+    # -----------------------------------------------------------------------
+    if [[ -n "$(find "${dlkm_full}" -maxdepth 1 -name '*.ko' -print -quit 2>/dev/null)" ]]; then
+        msg "Generating fs_config / file_contexts for vendor_dlkm"
+
+        mkdir -p "${AK3}/config"
+
+        cat >"${AK3}/config/vendor_dlkm_fs_config" <<EOF
+/ 0 0 0755
+vendor_dlkm/ 0 0 0755
+vendor_dlkm/lost+found 0 0 0755
+vendor_dlkm/etc 0 0 0755
+vendor_dlkm/etc/NOTICE.xml.gz 0 0 0644
+vendor_dlkm/etc/build.prop 0 0 0644
+vendor_dlkm/etc/fs_config_dirs 0 0 0644
+vendor_dlkm/etc/fs_config_files 0 0 0644
+vendor_dlkm/lib 0 0 0755
+vendor_dlkm/lib/modules 0 0 0755
+EOF
+
+        cat >"${AK3}/config/vendor_dlkm_file_contexts" <<EOF
+/ u:object_r:vendor_file:s0
+/vendor_dlkm(/.*)? u:object_r:vendor_file:s0
+/vendor_dlkm/etc(/.*)? u:object_r:vendor_configs_file:s0
+EOF
+
+        msg "depmod → vendor_dlkm"
+        _stage_and_depmod "${DLKM_DIR}" "${dlkm_full}"
+
+        local f
+        for f in "${dlkm_full}"/*; do
+            [[ -f "${f}" ]] || continue
+            echo "vendor_dlkm/lib/modules/$(basename "${f}") 0 0 0644" \
+                >>"${AK3}/config/vendor_dlkm_fs_config"
+        done
+
+        msg "Creating dlkm.tar.xz"
+        (
+            cd "${dlkm_full}" &&
+            tar -cpf - --transform='s|^\./|lib/modules/|' .
+        ) | xz -9e -T0 >"${DIST_DIR}/dlkm.tar.xz" ||
+            abort "Failed to create dlkm.tar.xz"
+
+        ok "vendor_dlkm archive → ${DIST_DIR}/dlkm.tar.xz"
+    fi
+
+    # -----------------------------------------------------------------------
+    # vendor_ramdisk
+    # -----------------------------------------------------------------------
+    if [[ -n "$(find "${vndr_full}" -maxdepth 1 -name '*.ko' -print -quit 2>/dev/null)" ]]; then
+        msg "depmod → vendor_ramdisk"
+        _stage_and_depmod "${VNDR_DIR}" "${vndr_full}"
+
+        msg "Creating dlkm.cpio.lz4"
+
+        local vndr_package="${VNDR_DIR}/.package"
+        rm -rf "${vndr_package}"
+        mkdir -p "${vndr_package}/lib/modules"
+        find "${vndr_full}" -maxdepth 1 -type f -exec cp -p {} "${vndr_package}/lib/modules/" \; ||
+            abort "Failed to stage vendor_ramdisk archive files"
+        (
+            cd "${vndr_package}" &&
+            find lib -mindepth 1 -print | sort |
+                cpio -o -H newc 2>/dev/null
+        ) | lz4 -l -12 --favor-decSpeed >"${DIST_DIR}/dlkm.cpio.lz4" ||
+            abort "Failed to create dlkm.cpio.lz4"
+
+        ok "vendor_ramdisk archive → ${DIST_DIR}/dlkm.cpio.lz4"
+    else
+        warn "No modules routed to vendor_ramdisk; skipping dlkm.cpio.lz4"
+    fi
+
+    # -----------------------------------------------------------------------
+    # system_dlkm — the in-tree kernel modules staged in out/dist/modules
+    # (modules-system.list, snapshotted by _copy_modules() before
+    # build_mmi_modules() adds the sm7435-modules drivers). Built
+    # automatically whenever the kernel build produced modules; the
+    # SYSTEM_DLKM_EXTRA array can still name additional modules (e.g. from
+    # sm7435-modules) to fold in on top of the automatic set.
+    # -----------------------------------------------------------------------
+    mkdir -p "${sdlkm_full}"
+
+    if [[ -s "${system_list}" ]]; then
+        _copy_by_name_list "${system_list}" "${sdlkm_full}"
+    else
+        warn "No in-tree kernel modules found (out/dist/modules); system_dlkm will rely on SYSTEM_DLKM_EXTRA only"
+    fi
+
+    for mod in "${SYSTEM_DLKM_EXTRA[@]}"; do
+        [[ -f "${DIST_DIR}/modules/${mod}" ]] || {
+            warn "SYSTEM_DLKM_EXTRA: missing ${mod}"
+            continue
+        }
+
+        cp -p "${DIST_DIR}/modules/${mod}" "${sdlkm_full}/" ||
+            abort "Failed to stage ${mod} into system_dlkm"
+    done
+
+    if [[ -n "$(find "${sdlkm_full}" -maxdepth 1 -name '*.ko' -print -quit 2>/dev/null)" ]]; then
+        mkdir -p "${AK3}/config"
+
+        cat >"${AK3}/config/system_dlkm_fs_config" <<EOF
+/ 0 0 0755
+system_dlkm/ 0 0 0755
+system_dlkm/lib 0 0 0755
+system_dlkm/lib/modules 0 0 0755
+EOF
+
+        cat >"${AK3}/config/system_dlkm_file_contexts" <<EOF
+/ u:object_r:system_file:s0
+/system_dlkm(/.*)? u:object_r:system_file:s0
+EOF
+
+        msg "depmod → system_dlkm"
+        _stage_and_depmod "${SDLKM_DIR}" "${sdlkm_full}"
+
+        for f in "${sdlkm_full}"/*; do
+            [[ -f "${f}" ]] || continue
+            echo "system_dlkm/lib/modules/$(basename "${f}") 0 0 0644" \
+                >>"${AK3}/config/system_dlkm_fs_config"
+        done
+
+        (cd "${sdlkm_full}" &&
+            tar -cpf - --transform='s|^\./|lib/modules/|' .) |
+            xz -9e -T0 >"${DIST_DIR}/sdlkm.tar.xz" ||
+            abort "Failed to create sdlkm.tar.xz"
+
+        ok "system_dlkm archive → ${DIST_DIR}/sdlkm.tar.xz"
+    else
+        warn "No modules routed to system_dlkm; skipping sdlkm.tar.xz"
+    fi
+
+    # -----------------------------------------------------------------------
+    # Recovery module load list, if supplied by the device-tree repository.
+    # -----------------------------------------------------------------------
+    if [[ -f "${RECOVERY_MODULES_LOAD_SRC}" ]]; then
+        mkdir -p "${AK3}/config"
+
+        cp -p "${RECOVERY_MODULES_LOAD_SRC}" \
+            "${AK3}/config/modules.load.recovery" ||
+            abort "Failed to stage modules.load.recovery"
+
+        ok "Recovery modules.load → ${AK3}/config/modules.load.recovery"
+    fi
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -574,6 +976,29 @@ dtb() {
     fi
 }
 
+# Stage prebuilt Motorola vendor modules from the companion tree. These
+# modules are already built and must not be rebuilt through the kernel M= path.
+stage_prebuilt_vendor_modules() {
+    local vendor_root="${KDIR}/sm7435-modules/motorola/drivers"
+    local vendor_list="$1"
+    local kofile
+    local count=0
+
+    [[ -d "${vendor_root}" ]] || return 1
+    mkdir -p "${DIST_DIR}/modules"
+
+    while IFS= read -r -d '' kofile; do
+        cp -p "${kofile}" "${DIST_DIR}/modules/" ||
+            abort "Failed to stage vendor module: ${kofile}"
+        basename "${kofile}" >> "${vendor_list}"
+        count=$((count + 1))
+    done < <(find "${vendor_root}" -type f -name '*.ko' -print0 2>/dev/null)
+
+    ((count > 0)) || return 1
+    sort -u -o "${vendor_list}" "${vendor_list}"
+    ok "${count} prebuilt vendor module(s) staged from ${vendor_root}"
+}
+
 # Build the Motorola MMI out-of-tree modules that are present in the tree.
 build_mmi_modules() {
     local -a mmi_modules=(
@@ -641,6 +1066,21 @@ build_mmi_modules() {
     local i module_dir
     mkdir -p "${DIST_DIR}/modules"
 
+    # sm7435-modules drivers, as they're built, are recorded here — this
+    # is the set that package_module_archives() routes into
+    # vendor_dlkm / vendor_ramdisk (as opposed to modules-system.list,
+    # snapshotted earlier in _copy_modules() for the in-tree kernel build).
+    local vendor_list="${DIST_DIR}/modules-vendor.list"
+    : > "${vendor_list}"
+
+    # The companion tree contains prebuilt vendor modules, including
+    # moto_sched/moto_sched.ko. Use them directly when available.
+    if stage_prebuilt_vendor_modules "${vendor_list}"; then
+        find "${DIST_DIR}/modules" -type f -name '*.ko' -print | sort \
+            > "${DIST_DIR}/modules.list"
+        return 0
+    fi
+
     for i in "${!mmi_modules[@]}"; do
         module_dir="${mmi_modules[$i]}"
 
@@ -663,10 +1103,14 @@ build_mmi_modules() {
             "${extra_args[@]}" ||
             abort "MMI module build failed: ${module_dir}"
 
-        find "${module_dir}" -type f -name '*.ko' -print0 2>/dev/null |
-            xargs -0 -r -I{} cp -p {} "${DIST_DIR}/modules/" ||
-            abort "Failed to copy MMI module: ${module_dir}"
+        while IFS= read -r -d '' kofile; do
+            cp -p "${kofile}" "${DIST_DIR}/modules/" ||
+                abort "Failed to copy MMI module: ${kofile}"
+            basename "${kofile}" >> "${vendor_list}"
+        done < <(find "${module_dir}" -type f -name '*.ko' -print0 2>/dev/null)
     done
+
+    sort -u -o "${vendor_list}" "${vendor_list}"
 
     find "${DIST_DIR}/modules" -type f -name '*.ko' -print | sort \
         > "${DIST_DIR}/modules.list"
@@ -709,6 +1153,7 @@ mod() {
         abort "modules_prepare failed for external modules"
 
     build_mmi_modules
+    package_module_archives
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -797,12 +1242,21 @@ mkzip() {
         warn "No device-specific DTB found in ${DIST_DIR}/dtbs"
     fi
 
-    # Modules
-    if [[ -d "${DIST_DIR}/modules" ]]; then
-        mkdir -p "${AK3}/modules/vendor_dlkm/lib/modules"
-        find "${DIST_DIR}/modules" -maxdepth 1 -name '*.ko' \
-            -exec cp -p {} "${AK3}/modules/vendor_dlkm/lib/modules/" \; 2>/dev/null || true
-    fi
+    # Modules — AOSP-compatible archives consumed directly by anykernel.sh
+    # (modules/dlkm.tar.xz → vendor_dlkm, modules/dlkm.cpio.lz4 → vendor_ramdisk,
+    # modules/sdlkm.tar.xz → system_dlkm). Built by package_module_archives()
+    # as part of `mod`.
+    mkdir -p "${AK3}/modules"
+    rm -f "${AK3}"/modules/{dlkm.tar.xz,dlkm.cpio.lz4,sdlkm.tar.xz} 2>/dev/null || true
+    local archive staged=0
+    for archive in dlkm.tar.xz dlkm.cpio.lz4 sdlkm.tar.xz; do
+        if [[ -f "${DIST_DIR}/${archive}" ]]; then
+            cp -p "${DIST_DIR}/${archive}" "${AK3}/modules/" || abort "Failed to stage ${archive}"
+            msg "Modules: ${archive}"
+            staged=1
+        fi
+    done
+    ((staged == 1)) || warn "No module archives found — run 'mod' before 'mkzip' if this build has modules"
 
     # Create the zip
     local zip_out="${DIST_DIR}/${ZIP_NAME}.zip"
@@ -853,6 +1307,7 @@ clean() {
     rm -rf "${OUT_DIR}" "${LOG_FILE}"
     if [[ -d "${AK3}" ]]; then
         rm -f "${AK3}"/{Image,Image.gz,Image.lz4,dtb,dtbo.img,*.zip} 2>/dev/null || true
+        rm -f "${AK3}"/config/{vendor_dlkm_fs_config,vendor_dlkm_file_contexts,system_dlkm_fs_config,system_dlkm_file_contexts,modules.load.recovery} 2>/dev/null || true
         rm -rf "${AK3}/modules"
     fi
     ok "Clean complete"
@@ -919,6 +1374,18 @@ ${BOLD}─── Environment overrides ─────────────�
   DEBUG_BUILD 1 = merge debug config fragment
   FETCH_AK3   1 = auto-clone AnyKernel3
   NO_COLOR    Set to disable colour output
+
+${BOLD}─── Module archives (built by 'mod', staged by 'mkzip') ──────────${NC}
+  Routed automatically by origin:
+    sm7435-modules (Motorola MMI drivers) → vendor_dlkm / vendor_ramdisk
+    in-tree kernel modules (out/dist/modules) → system_dlkm
+  vendor_dlkm / vendor_ramdisk split further honours, if present:
+    ${DEVICETREES_DIR}/modules/modules.load.vendor_dlkm
+    ${DEVICETREES_DIR}/modules/modules.load.vendor_boot
+    ${DEVICETREES_DIR}/modules/modules.load.recovery
+  If absent, every sm7435-modules driver falls back to vendor_dlkm.
+  VENDOR_RAMDISK_EXTRA / SYSTEM_DLKM_EXTRA arrays (top of script) add
+  specific modules into vendor_ramdisk / system_dlkm on top of that.
 
 ${BOLD}─── Examples ────────────────────────────────────────────────────${NC}
   bash $0 all
